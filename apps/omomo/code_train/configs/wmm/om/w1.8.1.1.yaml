@@ -1,0 +1,224 @@
+expname: w1.8.1.1_omomo
+
+# w1.8.x family — forked from w1.7.x.
+#
+# Three deltas vs w1.7.x:
+#   1. ``chois_obj_waypoints_to_all`` (legacy, full-SE(3) leak): weight
+#      6.0 -> 1.0. The leaky pattern is no longer dominant in training.
+#   2. New ``chois_strict`` pattern (mask_scheduler.py) added at weight
+#      1.0. Mirrors eval-time M1 (partial_chois="strict"): only obj@0
+#      + body@0 marked known; intermediate xy/end-xyz signal is delivered
+#      at inference time via ``chois_mode="replace"``. Training and the
+#      CHOIS-faithful eval protocol are now aligned at the per-token mask
+#      level.
+#   3. ``viz_every_n_train_steps`` 1000 -> 2000. Viz is the bottleneck on
+#      sub-3 min cycles; halving the rate doubles training-side throughput.
+#
+# All other w1.7.x specifics (Phase B losses, hand-object SDF / contact /
+# penetration heads in 1.7.1.x and 1.7.2.x, layer schedule, BS, optim) are
+# inherited unchanged. See the ORIGINAL w1.7.x comment block below for those.
+
+# w1.7.1.1 — w1.7.1 with stronger aux loss weights (4x).
+#
+# Delta vs w1.7.1:
+#   loss_sdf_penetration_weight: 0.25 -> 1.0  (4x; restores w1.6.0 default)
+#   loss_contact_weight:         0.25 -> 1.0  (4x; restores w1.6.0 default)
+# Total aux loss mass: 0.5 -> 2.0
+#
+# All other knobs unchanged. See w1.7.1 header below for full lineage.
+#
+# w1.7.1 — w1.7.0 + (w1.6.0 - w1.5.0) upgrade.
+#
+# Equivalent to taking the w1.6.0 hand-object loss + on-the-fly-eval
+# upgrade and stacking it on top of the w1.7.0 base (which is w1.5.0 with
+# CHOIS Table 1 protocol fix: omomo_v3 data + chois mask weight 6.0 +
+# code-side mask_scheduler/dataset/eval/viz fixes already in repo).
+#
+# Concretely vs w1.7.0:
+#   + loss_sdf_penetration_weight: 0.25   (palm-only SDF penetration loss; was 1.0 in w1.6.0, dampened to 0.25 here)
+#   + loss_contact_weight: 0.25           (hand-object contact loss; was 1.0 in w1.6.0, dampened to 0.25 here)
+#   + penetration_margin_m, contact_threshold_m, hand joint indices, etc.
+#   + on-the-fly WmmOmomoEvalCallback at eval_sample_ratio: 0.02
+#   + viz_penetration_flag: True (penetration viz module)
+#   + viz_try: False (catch viz bugs during dev)
+#
+# Concretely vs w1.6.0:
+#   + data_root omomo_v2 -> omomo_v3 (CHOIS-correct waypoints + body t0)
+#   + chois mask weight 1.0 -> 6.0 (50% of training samples on-protocol)
+#
+# Original w1.6.0 header retained below for context:
+#
+# w1.6.0 — w1.5.0 + hand-object SDF/contact loss + on-the-fly eval
+#
+# Inherits w1.5.0 (layer schedule "tpatpatpt" + skip [0,3,6,8], BS=16, max_T=120).
+# w1.6.x family delta vs w1.5.0: hand-object SDF penetration + contact loss,
+#   on-the-fly WmmOmomoEvalCallback (eval_effort=0.02), penetration viz.
+# w1.6.0 specifically: base of the family from w1.5.0.
+#
+# train_batchsize finalized post-probe (probe-A, BS16 fits T=120 on A6000; BS=32 OOM).
+
+max_steps: 1_000_000
+train_batchsize: 16  # finalized post-probe (probe-A=BS16 fits T=120 on A6000; BS=32 OOM)
+accumulate_grad_batches: 1
+workers: 10
+log_every_n_steps: 5
+val_every_n_iter: 10000
+limit_val_batches: 50
+
+dataset:
+  name: wmm
+  dataloader_drop_last: True
+  persistent_workers_flag: True
+  prefetch_factor: 4
+  sampler_mode: "len_balanced"
+  sampling_weights: [1.0]
+  configs:
+    - type: omomo
+      data_root: ./data_wmm/omomo_v3
+      splits:
+        train: train
+        val: test
+      t_rate: 1
+      max_T: 120
+      max_C: 1
+      max_objects: 1
+      max_P_per_object: 256
+      num_pts: 256
+      text_required: True
+      mask_scheduler:
+        base_random_prob: 0.25
+        pattern_weights:
+          chois_obj_waypoints_to_all: 1.0
+          chois_strict: 1.0
+          random_prefix_future: 1.0
+          omomo_h2o: 1.0
+          omomo_o2b: 1.0
+
+model:
+  name: wmm
+  latent_dim: 512
+  feat_dim: 1024
+  use_ema: True
+  compile_flag: True
+  hand_attached_to_wrist_flag: False
+  rot_parameterization: "6d_wing"
+  rot_wing_len: 0.2
+  loss_sdf_penetration_weight: 1.0   # w1.7.1.1: 4x stronger than w1.7.1 (0.25); restores w1.6.0 default magnitude
+  loss_contact_weight: 1.0           # w1.7.1.1: 4x stronger than w1.7.1 (0.25); restores w1.6.0 default magnitude
+  contact_threshold_m: 0.02
+  contact_label_eps_m: 0.05
+  penetration_margin_m: 0.005
+  hand_palm_joint_idx: [25, 40]   # SMPL-X L/R index1 base (55-joint; see A2 audit)
+  hand_wrist_joint_idx: [20, 21]
+  sdf_v2_dir: "data_wmm/omomo_v3/rest_object_sdf_v2"
+  smplx_dir: "data_wmm/omomo_v3"   # PARENT of smplx/ subfolder (smplx.create requires parent)
+  rest_geo_dir: "data_wmm/omomo_v3/rest_object_geo"
+
+  canonicalization:
+    target_pos_std: 0.5
+    canon_rotation: False
+
+  diffusion:
+    noise_type: ddpm
+    prediction_type: sample
+    network_output_space: null
+    async_noise: True
+    num_train_timesteps: 100
+    beta_schedule: squaredcos_cap_v2
+    gen_timesteps: 20
+    sync_noise_prob: 0.5
+
+  input_layer:
+    num_types: 1024
+    num_groups: 1024
+    language_fixed_length: 32
+    point_encoder_latent: 256
+    pcl_input_mode: "xyz_rgb"
+    point_version: "v3"
+
+  lmm:
+    mode: super
+    architecture: super
+    D1: 512
+    D2: 512
+    n_heads: 8
+    fc_factor: 4
+    layer_type_string: "tpatpatpt"
+    skip_layer_idx_list: [0, 3, 6, 8]
+    Rt: 2
+    Rp: 2
+    time_multiplier: 30.0
+    ada_scale_bias_bound: 0.8
+    gate_bound: 2.0
+    fc_n_layers: 2
+    fc_out_n_layers: 4
+    ada_n_layers: 3
+    n_traj_tokens: 256
+    cond_dim: 1024
+    rope_mode: "2d_time_trajid"
+    entity_rope_multiplier: 0.0
+    disable_trajpe: False
+    mot_3way: True
+    traj_id_sampler: "permP"
+    traj_pe_init: "std"
+    ctx_reg_unique_positions: True
+
+  optim:
+    weight_by: uid
+    text_masked_prob: 0.25
+    ctx_always_known: False
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-3
+    lr: 5.0e-5
+    min_lr: 0.000001
+    lr_decay_iters: 300000
+    lr_warmup_iters: 100
+    loss_beta: 0.02
+    w_real: 1.0
+    w_virtual: 1.0
+    movement_reweight_min_ratio: 0.5
+    movement_reweight_max_ratio: 4.0
+    movement_scale: 1.0
+    w_R: 0.5
+    w_ctx: 0.1
+
+callbacks:
+  omomo_eval:
+    enabled: True
+    val_every_n_iter: 10000          # w1.6.0 — production cadence per spec
+    eval_sample_ratio: 0.02          # initial calibration; tune to ≤10 min wall in C3
+    gt_dir: ./data_wmm/omomo_v3/test_npz
+    smplx_dir: ./data_wmm/omomo_v3/smplx
+    sdf_folder: ./data_wmm/omomo_v3/rest_object_sdf
+    obj_geo_dir: ./data_wmm/omomo_v3/rest_object_geo
+    classifier_ckpt: ./data_wmm/omomo_v3/artifacts/classifier/text_motion_features/model/finest.tar
+    debug_threshold: 100
+    max_bs_start: 8
+
+visualize:
+  omomo:
+    smplx_dir: ./data_wmm/omomo_v3/smplx
+    geo_dir: ./data_wmm/omomo_v3/rest_object_geo
+    data_root: ./data_wmm/omomo_v3
+    viz_look_at: [0.0, 0.0, 1.0]
+    viz_stand_at: [3.0, 3.0, 2.0]
+    height: 512
+    width: 512
+
+precision: 16
+matmul_precision: medium
+init_seed: 42
+use_wandb: True
+num_sanity_val_steps: 0
+viz_every_n_train_steps: 2000
+viz_every_n_val_steps: 100
+viz_try: False                # set False during dev (catches viz bugs); flip True via CLI for prod launch
+viz_penetration_flag: True    # B2 module wired into omomo_viz._maybe_log_penetration_viz
+gradient_clip_val: 1.0
+gradient_clip_algorithm: norm
+ckpt_monitor: "omomo_eval/MPJPE"
+ckpt_warmup_steps: 10001  # = callbacks.omomo_eval.val_every_n_iter + 1; first MPJPE log at step 10000
+ckpt_monitor_mode: "min"
+ckpt_save_top_k: 1
+ckpt_every_n_train_steps: 2000
+model_summary_detailed_level: 3

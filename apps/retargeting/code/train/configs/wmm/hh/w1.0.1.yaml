@@ -1,0 +1,217 @@
+expname: w1.0.1_hh_single
+
+# w1.0_hh — humanoid retargeting under wmm (DiT-super, non-MoT, 9-layer
+# tpatpatpt). Mirrors the historical g7.17.x lineage (gemm_v1) on the
+# wmm side: same datasets (embody3d + amass_humanoid_v2), same async
+# noise (sync_noise_prob=0.0 → 100% per-token), same 16384-deep
+# ctx_record buffer, same prepare_attributes layout (SMPLX55 + G1).
+#
+# Strict additive wrt other wmm configs: this is the FIRST wmm config
+# to use the new model.ctx_record opt-in block. All w1.5.x / w1.6.x /
+# w1.7.x / w1.8.x configs continue to behave bit-identically because
+# they don't carry that block.
+
+max_steps: 1_000_000
+train_batchsize: 8  # compiled BS for 290M w1.0.1 super-LMM-MoT, 49GB A6000
+accumulate_grad_batches: 1
+workers: 12
+log_every_n_steps: 5
+val_every_n_iter: 10000
+limit_val_batches: 50
+
+dataset:
+  name: wmm
+  dataloader_drop_last: True
+  persistent_workers_flag: True
+  prefetch_factor: 4
+  sampler_mode: "len_balanced"
+  # 80% AMASS / 20% Embody3D (resolved Q8 in alignment doc).
+  # Index order matches `configs:` below: [embody3d, amass].
+  sampling_weights: [1.0, 4.0]
+  configs:
+    - type: multi_humanhumanoid
+      data_root: ./data/embody3d_phuma_processed
+      splits:
+        train: ./data_splits/embody3d_humanoid_v2/full_train.json
+        val: ./data_splits/embody3d_humanoid_v2/debug_val.json
+      t_rate: 1
+      max_T: 30
+      max_C: 9
+      max_P: 1
+      max_G: 2
+      embodiment_dirs:
+        smplx: hand_duo_subset/human_states
+        g1: g1/g1_states
+      center_self_flag: True
+      human_sample_bias_prob: 1.0
+      max_robot_per_person: 1
+      remap_hands_to_mano_sem: False
+      wrist_local_coords: False
+      hand_attached_to_wrist_flag: False
+      z_rot_aug: True
+    - type: multi_humanhumanoid
+      data_root: ./data/amass_phuma_v2
+      splits:
+        train: ./data_splits/amass_humanoid_v2/full_train.json
+        val: ./data_splits/amass_humanoid_v2/debug_val.json
+      t_rate: 1
+      max_T: 30
+      max_C: 9
+      max_P: 1
+      max_G: 2
+      embodiment_dirs:
+        smplx: g1/human_states
+        g1: g1/g1_states
+        h12: h12/h12_states
+      center_self_flag: True
+      human_sample_bias_prob: 1.0
+      max_robot_per_person: 1
+      remap_hands_to_mano_sem: False
+      wrist_local_coords: False
+      hand_attached_to_wrist_flag: False
+      z_rot_aug: True
+
+model:
+  name: wmm
+  latent_dim: 512
+  feat_dim: 512
+  use_ema: True
+  compile_flag: True
+  hand_attached_to_wrist_flag: False
+  rot_parameterization: "6d_wing"
+  rot_wing_len: 0.2
+
+  canonicalization:
+    target_pos_std: 0.5
+    canon_rotation: False
+
+  diffusion:
+    noise_type: ddpm
+    prediction_type: sample
+    network_output_space: null
+    # Purely async per-token noise — matches g7.17.2.yaml verbatim
+    # (gemm_v1.__prepare_df_step__ default branch, verified in align doc).
+    async_noise: True
+    sync_noise_prob: 0.0
+    num_train_timesteps: 100
+    beta_schedule: squaredcos_cap_v2
+    gen_timesteps: 10
+
+  input_layer:
+    num_types: 1024
+    num_groups: 1024
+    language_fixed_length: 1
+    point_encoder_latent: -1
+    pcl_input_mode: "xyz"
+    point_version: "v3"
+
+  lmm:
+    mode: super
+    architecture: super
+    D1: 512
+    D2: 512
+    n_heads: 8
+    fc_factor: 4
+    layer_type_string: "tpatpatpt"
+    skip_layer_idx_list: [0, 3, 6, 8]
+    Rt: 4
+    Rp: 4
+    time_multiplier: 10.0     # gemm_v1 style (NOT w1.8's 30.0)
+    ada_scale_bias_bound: 0.8
+    gate_bound: 2.0
+    fc_n_layers: 2
+    fc_out_n_layers: 12
+    ada_n_layers: 3
+    n_traj_tokens: 128        # gemm_v1 style (NOT w1.8's 256)
+    cond_dim: -1
+    rope_mode: "2d_time_trajid"
+    entity_rope_multiplier: 0.0
+    disable_trajpe: False
+    mot_3way: True            # ON — w1.0.1_hh enables MoT 3-way (vs w1.0 non-MoT)
+    traj_id_sampler: "permP"
+    traj_pe_init: "std"
+    ctx_reg_unique_positions: True
+
+  # ── NEW OPT-IN BLOCK ──────────────────────────────────────────────
+  # Enables ctx_record buffer write at training time + checkpoint
+  # serialization. Standalone humanoid retargeting eval reads the
+  # buffer via hh_boost / hh_joint_infer (see agent.py for details).
+  # Removing this block reverts wmm.Agent to bit-identical behavior
+  # vs all w1.5.x / w1.6.x / w1.7.x / w1.8.x configs.
+  ctx_record:
+    buffer_size: 16384
+
+  human:
+    model_path: "./data/smpls"
+    model_type: smplx
+    gender: neutral
+  humanoid:
+    mesh_fn:
+      g1: ./data/amass_phuma/g1_link_meshes_simplified.npz
+      h12: ./data/amass_phuma/h12_link_meshes_simplified.npz
+      t1: ./data/amass_phuma/t1_link_meshes_simplified.npz
+
+  optim:
+    weight_by: uid
+    # HH has no language modality — text masking irrelevant.
+    text_masked_prob: 0.0
+    ctx_always_known: False
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-3
+    lr: 5.0e-5
+    min_lr: 0.000001
+    lr_decay_iters: 300000
+    lr_warmup_iters: 100
+    loss_beta: 0.02
+    w_real: 1.0
+    w_virtual: 0.1
+    w_R: 0.5
+    movement_reweight_min_ratio: 0.0
+    movement_reweight_max_ratio: 10.0
+    movement_scale: 1.0
+
+callbacks:
+  hh_eval:
+    enabled: True
+    val_every_n_iter: 10000
+    debug_threshold: 100
+    test_split_fn: ./data_splits/amass_humanoid_v2/full_test.json
+    human_data_root: ./logs/eval/humanoid/amass_human_test
+    smplx_dir: ./data/smpls
+    humanoid_mesh_fn: ./data/amass_phuma_v2/g1/robot_meshes.npz
+    urdf_fn: ./ext/lib_twist/src/lib_twist/assets/g1/g1_custom_collision_with_fixed_hand.urdf
+    n_seqs_prod: 10
+    n_seqs_debug: 2
+    sampling_stride: 201      # 0, 201, 402, ..., 1809 = 10 evenly-spaced
+    ctx_len: 9
+    window_len: 30
+    window_overlap: 5
+    gen_steps: 10
+    humanoid_type: g1
+    human_type: smplx
+    cond_step: 0
+    viz_skip: 3
+    mjc_threads: 16
+    max_budget_s: 1800.0
+
+visualize:
+  humanhumanoid:
+    local_global_trans_factor_flag: False
+    viz_stand_at: [1.0, 3.0, 2.0]
+    viz_look_at:  [1.0, 0.0, 1.0]
+
+precision: 16
+matmul_precision: medium
+init_seed: 42
+use_wandb: True
+num_sanity_val_steps: 0
+viz_every_n_train_steps: 2000
+viz_every_n_val_steps: 50
+viz_try: True
+gradient_clip_val: 1.0
+gradient_clip_algorithm: norm
+ckpt_monitor: "total_loss/train"
+ckpt_monitor_mode: "min"
+ckpt_save_top_k: 1
+ckpt_every_n_train_steps: 2000
+model_summary_detailed_level: 3

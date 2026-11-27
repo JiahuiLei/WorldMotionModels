@@ -1,0 +1,7 @@
+numpy
+pybullet
+gym<=0.23.0
+opencv-python
+scipy
+absl-py
+six

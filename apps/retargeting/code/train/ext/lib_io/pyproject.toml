@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lib_io"
+version = "0.1.0"
+description = "Unified I/O library for robotics dataset storage (RGB, depth, segmentation, NPZ, packed zips)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "Pillow",
+    "imageio",
+    "pycocotools",
+]
+
+[project.optional-dependencies]
+turbo = ["PyTurboJPEG"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lib_io*"]

@@ -1,0 +1,191 @@
+# WMM TraceGen (TG) DROID K=128 — w1.6.0 (single-knob delta off w1.5.0).
+# DELTA: replace dummy identity rotation with REAL local-frame rotations
+# from data_wmm/tracegen_localframes/. Per-track re-anchored so t=0 (current
+# frame) is identity → context naturally identity. Per-frame rot_valid is
+# folded into trace_mask (α-mode); ~40% of frames lose position supv as a
+# known cost. Loss weights kept at w1.5.0: w_q=0.1, w_R=0.0 (rot supervised
+# via 6d-channel L1, geodesic disabled).
+# Robust-to-missing: samples without a sidecar fall back to identity rot
+# (rot_mask=False); init logs coverage. Eval/viz callbacks do NOT load
+# localframe — they prompt with t=0=I (matches training distribution).
+# compile_flag=True is MANDATORY in YAML; --fast_dev_run smoke uses
+# --model.compile_flag=False CLI override only.
+
+expname: w1.6.0_droid_k128_tpsqspt
+
+max_steps: 1_000_000
+train_batchsize: 12  # w1.5.0 K=128: 4x of K=400 sibling (BS=4). Compiled
+                     # may need lower; monitor first launch (w1.1 K=128 ran
+                     # at BS=22 with D1=128, but D1=512 here is heavier).
+accumulate_grad_batches: 1
+workers: 10
+log_every_n_steps: 5
+val_every_n_iter: 10000
+limit_val_batches: 50
+
+dataset:
+  name: wmm
+  dataloader_drop_last: True
+  persistent_workers_flag: True
+  prefetch_factor: 4
+  sampling_weights: [1.0]
+  configs:
+    - type: tracegen
+      env_name: droid
+      data_root: ./data_wmm/tracegen/data
+      splits: ["train", "val", "test"]
+      num_kps: 128   # K=128 sibling
+      trajectory_horizon: 32
+      image_size: 384
+      val_split: 0.01
+      random_seed: 42
+      safe_flag: True
+      base_fps: 30.0   # LMM time-axis: see wmm/datamodule.py:155 (TG bug fix)
+      t_rate: 1
+      dummy_id_rot: False  # w1.6.0: real rot loaded via localframe_root
+      localframe_root: ./data_wmm/tracegen_localframes  # w1.6.0
+                           # diffusion. Pair with optim.w_q to weaken rot loss.
+
+model:
+  name: wmm
+  latent_dim: 512
+  feat_dim: 1024
+  use_ema: True
+  compile_flag: True
+  rot_parameterization: "6d_wing"
+  rot_wing_len: 0.2
+
+  canonicalization:
+    target_pos_std: 0.25
+    canon_rotation: False
+    per_axis_std: True   # w1.3.0: per-axis std → per-axis scale (no tanh).
+                         # Default False keeps legacy scalar behavior.
+
+  diffusion:
+    noise_type: ddpm
+    prediction_type: sample
+    network_output_space: null
+    async_noise: True
+    num_train_timesteps: 1000
+    beta_schedule: squaredcos_cap_v2
+    gen_timesteps: 50
+    sliding_window_anchors: 64   # K=128 sliding inference anchor count
+
+  input_layer:
+    num_types: 1024
+    num_groups: 400
+    language_fixed_length: 16
+    point_encoder_latent: 256
+    pcl_input_mode: "xyz_rgb"
+    point_version: "v3"
+
+  dino_encoder:
+    model_name: dinov3_vits16
+    num_views: 1
+    trainable: False
+
+  lmm:
+    mode: super
+    architecture: super
+    D1: 512
+    D2: 768
+    cond_dim: 1024
+    n_heads: 8
+    fc_factor: 4
+    layer_type_string: "tpsqspt"
+    Rt: 4
+    Rp: 4
+    time_multiplier: 10.0
+    ada_scale_bias_bound: 1.0
+    gate_bound: 2.0
+    fc_n_layers: 3
+    fc_out_n_layers: 8
+    ada_n_layers: 3
+    n_traj_tokens: 400            # iter 02: revert from 1024 — testing whether
+                                   # real_timestep fix alone (without my SW
+                                   # stable_ids fix) eliminates collapse.
+    add_first_n_add_token_to_feat: 16
+    rope_mode: "2d_time_trajid"   # w1.3.0: required by disable_trajpe=True
+                                  # (else model loses all entity-id signal)
+    traj_id_sampler: "permP"      # iter 02: revert.
+    disable_trajpe: True           # drop the learned per-id trajpe embedding;
+                                  # 2D RoPE entity phase carries the id signal
+
+  optim:
+    weight_by: uid
+    text_masked_prob: 0.25
+    ctx_always_known: True
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-3
+    lr: 5.0e-5
+    min_lr: 1.0e-6
+    lr_decay_iters: 300000
+    lr_warmup_iters: 500
+    loss_beta: 0.02
+    w_real: 1.0
+    w_virtual: 0.05
+    movement_reweight_min_ratio: 0.5
+    movement_reweight_max_ratio: 4.0
+    movement_scale: 2.0
+    w_R: 0.0
+    w_q: 0.1   # w1.3.0: weaken rot6d-channel loss (paired with dummy_id_rot
+               # — rotation is a constant identity placeholder, not real GT).
+    w_mae: 0.5   # w1.5.0: per-channel L1 (sum xyz) on position only, weighted
+                 # 0.5 * w_real (or w_virtual). Default 0.0 in code = disabled.
+                 # Added to optimize the eval `trajectory_mae` metric directly.
+
+visualize:
+  tg:
+    env_name: droid
+    image_size: 384
+    max_scaffold_pts: 2500
+
+# wired Tg128EvalCallback (sliding-window inference K_train=128 → P_test=400).
+# Dispatch is by callback_class; K_train is read from dataset.configs[0].num_kps and
+# anchor_count from model.diffusion.sliding_window_anchors (above).
+tg_eval:
+  callback_class: Tg128EvalCallback
+  env_name: droid
+  test_data_root: ./data_wmm/tracegen/data
+  eval_every_n_steps: 10000
+  batch_size: 4
+  debug_every_n_steps: -1
+  debug_subset_n_samples: 16
+  num_workers: 4
+  eval_effort: 0.03
+  base_fps: 30.0   # MUST match dataset entry above (LMM RoPE phases)
+  t_rate: 1
+
+  dummy_id_rot: True  # w1.6.0: eval/viz prompt with rot_mask all-True;
+  # localframe NOT loaded — t=0=I prompt matches training
+# full P=400 sliding-window inference VIZ (MP4) on a fixed 1-sample
+# reference, every 500 training steps. Wraps inference_sliding_window so the
+# user can watch the deployed K=128 -> P=400 path improve over training.
+# Output: logs/<expname>/version_<V>/tg_viz/*_K400sw_<step>_{gt,pred}.mp4
+tg128_sliding_viz:
+  env_name: droid
+  test_data_root: ./data_wmm/tracegen/data
+  viz_every_n_train_steps: 500
+  image_size: 384
+  dummy_id_rot: True  # w1.6.0: viz prompts rot_mask all-True
+
+precision: 16
+matmul_precision: medium
+init_seed: 42
+num_sanity_val_steps: 0
+viz_every_n_train_steps: 500   # debug cadence — match tg128_sliding_viz
+viz_every_n_val_steps: 100
+viz_try: True
+gradient_clip_val: 4.0
+gradient_clip_algorithm: norm
+ckpt_monitor: "tg_eval/droid/trajectory_mae_x100"   # w1.5.0: switch from
+                                                     # train-loss to eval MAE.
+ckpt_monitor_mode: "min"
+ckpt_save_top_k: 1
+ckpt_every_n_train_steps: 2000
+ckpt_warmup_steps: 11000   # w1.5.0: skip topk until just past first eval at
+                            # step 10000 (tg_eval.eval_every_n_steps=10000).
+                            # Prevents fallback from permanently mutating the
+                            # monitor before the metric is logged.
+model_summary_detailed_level: 3
+use_wandb: True

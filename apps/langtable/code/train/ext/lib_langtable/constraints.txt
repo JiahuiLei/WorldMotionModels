@@ -1,0 +1,9 @@
+# Keep resolver from exploring ancient urllib3 / requests combos
+urllib3>=1.26,<3
+requests>=2.28,<3
+
+# TF ecosystem usually needs protobuf bounded
+protobuf>=3.20.3,<8
+
+# Avoid a lot of backtracking noise
+typing-extensions>=4.8

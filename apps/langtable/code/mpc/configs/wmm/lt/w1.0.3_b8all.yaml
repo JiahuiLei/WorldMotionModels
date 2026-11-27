@@ -1,0 +1,239 @@
+expname: w1.0.3_b8all
+
+# WMM w1.0.3 — deeper-FC fork of w1.0.1_b8all.yaml.
+#
+# Exploration: on top of the w1.0.1 deeper-LMM backbone, does a deeper
+# per-layer transformer-block FC MLP (2 -> 4 layers) further improve LT
+# performance, at the cost of extra compute / potential compile complexity?
+#
+# Identical to w1.0.1_b8all.yaml EXCEPT:
+#   - expname: w1.0.1_b8all -> w1.0.3_b8all
+#   - model.lmm.fc_n_layers: 2 -> 4
+#       Per-layer transformer-block FC MLP uses 4 linear layers instead of 2.
+#
+# All other architecture (layer_type_string "tpaaaaapt", ada_n_layers: 5,
+# skip_layer_idx_list [2,4,6,7,8], fc_out_n_layers: 4, D1/D2=512, etc.),
+# LR schedule, weight decay, max_steps, precision, batch size, compile
+# flag (True), danger-zone values, dataset entries, viz settings, and
+# eval callback settings are unchanged from w1.0.1_b8all.yaml.
+#
+# COMPILE-RISK FLAG: fc_n_layers=2 is the tested
+# stable compile value; user was emphatic about known compile bugs with
+# deeper layers. fc_n_layers=4 is UNTESTED and may hit Triton shared-memory
+# limits (A6000 ~101 KB) or dynamo recompile-limit bailouts. gates
+# landing on a `fast_dev_run 50` compile-smoke with `TORCH_LOGS=recompiles`
+# on the b8b2b sibling proving zero recompiles / zero graph breaks /
+# finite loss at steps 1, 25, 50.
+
+max_steps: 1_000_000
+train_batchsize: 64
+accumulate_grad_batches: 1
+workers: 10
+log_every_n_steps: 5
+val_every_n_iter: 10000
+limit_val_batches: 50
+
+dataset:
+  name: wmm
+  dataloader_drop_last: True
+  persistent_workers_flag: True
+  prefetch_factor: 4
+  sampler_mode: "len_balanced"
+  # Uniform weights: each task is drawn with equal probability per batch.
+  # Per-task train index counts (dataset length after time-step expansion) are
+  # unequal due to variable episode lengths — measured as:
+  #   block2absolutelocation         2_667_057
+  #   block2block                    2_165_609
+  #   block2block_relative_location  2_174_557
+  #   block2relativelocation         1_459_112
+  #   separate_blocks                  555_118
+  # len_balanced + uniform weights therefore OVERsamples separate_blocks
+  # (~3.25x vs its natural frequency) and UNDERsamples block2absolutelocation
+  # (~0.68x). This is intentional for "all 5 tasks equally important"
+  # training; to match natural frequency instead, use weights proportional
+  # to the per-task lengths above. When running a subset, delete the
+  # unwanted entries AND trim this list to the same length.
+  sampling_weights: [1.0, 1.0, 1.0, 1.0, 1.0]
+  configs:
+    - type: langtable_oracle
+      data_root: ./data_wmm/langtable/oracle_gen_block8_181k/block2absolutelocation
+      splits:
+        train: ./data_splits/langtable_official/b8all181k_block2absolutelocation_train.json
+        val: ./data_splits/langtable_official/b8all181k_block2absolutelocation_val.json
+        test: ./data_splits/langtable_official/b8all181k_block2absolutelocation_test.json
+      t_rate: 1
+      max_T: 20
+      num_pts: 256
+    - type: langtable_oracle
+      data_root: ./data_wmm/langtable/oracle_gen_block8_181k/block2block
+      splits:
+        train: ./data_splits/langtable_official/b8all181k_block2block_train.json
+        val: ./data_splits/langtable_official/b8all181k_block2block_val.json
+        test: ./data_splits/langtable_official/b8all181k_block2block_test.json
+      t_rate: 1
+      max_T: 20
+      num_pts: 256
+    - type: langtable_oracle
+      data_root: ./data_wmm/langtable/oracle_gen_block8_181k/block2block_relative_location
+      splits:
+        train: ./data_splits/langtable_official/b8all181k_block2block_relative_location_train.json
+        val: ./data_splits/langtable_official/b8all181k_block2block_relative_location_val.json
+        test: ./data_splits/langtable_official/b8all181k_block2block_relative_location_test.json
+      t_rate: 1
+      max_T: 20
+      num_pts: 256
+    - type: langtable_oracle
+      data_root: ./data_wmm/langtable/oracle_gen_block8_181k/block2relativelocation
+      splits:
+        train: ./data_splits/langtable_official/b8all181k_block2relativelocation_train.json
+        val: ./data_splits/langtable_official/b8all181k_block2relativelocation_val.json
+        test: ./data_splits/langtable_official/b8all181k_block2relativelocation_test.json
+      t_rate: 1
+      max_T: 20
+      num_pts: 256
+    - type: langtable_oracle
+      data_root: ./data_wmm/langtable/oracle_gen_block8_181k/separate_blocks
+      splits:
+        train: ./data_splits/langtable_official/b8all181k_separate_blocks_train.json
+        val: ./data_splits/langtable_official/b8all181k_separate_blocks_val.json
+        test: ./data_splits/langtable_official/b8all181k_separate_blocks_test.json
+      t_rate: 1
+      max_T: 20
+      num_pts: 256
+
+model:
+  name: wmm
+  latent_dim: 512
+  feat_dim: 1024
+  use_ema: True
+  compile_flag: True
+  hand_attached_to_wrist_flag: False
+  rot_parameterization: "6d_wing"
+  rot_wing_len: 0.2
+
+  canonicalization:
+    target_pos_std: 0.5
+    canon_rotation: False
+
+  diffusion:
+    noise_type: ddpm
+    prediction_type: sample
+    network_output_space: null
+    async_noise: True
+    num_train_timesteps: 100
+    beta_schedule: squaredcos_cap_v2
+    gen_timesteps: 10
+
+  input_layer:
+    num_types: 1024
+    num_groups: 1024
+    language_fixed_length: 16
+    point_encoder_latent: 256
+    pcl_input_mode: "xyz_rgb"
+    point_version: "v3"
+
+  lmm:
+    mode: super
+    architecture: super
+    D1: 512
+    D2: 512
+    n_heads: 8
+    fc_factor: 4
+    layer_type_string: "tpaaaaapt"
+    skip_layer_idx_list: [2, 4, 6, 7, 8]
+    Rt: 2
+    Rp: 2
+    time_multiplier: 10.0
+    ada_scale_bias_bound: 0.8
+    gate_bound: 2.0
+    fc_n_layers: 4
+    fc_out_n_layers: 4
+    ada_n_layers: 5
+    n_traj_tokens: 0
+    cond_dim: 1024
+    # V13.8 Feature A: first N=16 lang tokens projected and
+    # concatenated into cond_parts via hard_ln_lat. cond_dim already 1024.
+    add_first_n_add_token_to_feat: 16
+
+  langtable:
+    # Robot/object mesh paths for the LangTableVisualizer. All 5 task subdirs
+    # use the SAME robot + block meshes — the per-task subdirs
+    # {block2absolutelocation, block2block_relative_location,
+    #  block2relativelocation, separate_blocks} contain symlinks pointing to
+    # block2block/{robot,object}_embodiment.npz. So hardcoding block2block/
+    # here is correct for all 5 tasks. If a future task introduces a different
+    # embodiment, add a per-task model.langtable switch.
+    model_path: ./data_wmm/langtable/oracle_gen_block8_181k/block2block/robot_embodiment.npz
+    object_path: ./data_wmm/langtable/oracle_gen_block8_181k/block2block/object_embodiment.npz
+    num_pts: 256
+    window: 20
+    hist: [5]
+    act_horizon: [10]
+    rollout_flag: True
+
+  optim:
+    weight_by: uid
+    text_masked_prob: 0.25
+    ctx_always_known: False
+    betas: [0.9, 0.999]
+    weight_decay: 1.0e-3
+    lr: 5.0e-5
+    min_lr: 0.000001
+    lr_decay_iters: 300000
+    lr_warmup_iters: 100
+    loss_beta: 0.02
+    w_real: 1.0
+    w_virtual: 1.0
+    movement_reweight_min_ratio: 0.5
+    movement_reweight_max_ratio: 4.0
+    movement_scale: 1.0
+    w_R: 0.5
+
+visualize:
+  langtable:
+    viz_stand_at: [0.38, 0.0, 0.5]
+    viz_look_at: [0.38, 0.0, 0.0]
+    add_cfg: [1.0, 4.0]
+    # Deploy-viz task scope. Expanded to all 5 Protocol A tasks so
+    # per-task deploy videos are rendered in-training for every
+    # reward factory — matches the 5-task dataset mix in this config.
+    tasks:
+      - blocktoblock
+      - blocktoabsolutelocation
+      - blocktoblockrelativelocation
+      - blocktorelativelocation
+      - separate
+
+precision: 16
+matmul_precision: medium
+init_seed: 42
+num_sanity_val_steps: 0
+viz_every_n_train_steps: 2000
+viz_every_n_val_steps: 100
+viz_try: True # Production: wrap viz in try/except so a viz failure cannot kill training.
+gradient_clip_val: 1.0
+gradient_clip_algorithm: norm
+ckpt_monitor: "total_loss/train"
+ckpt_monitor_mode: "min"
+ckpt_save_top_k: 1
+ckpt_every_n_train_steps: 2000
+model_summary_detailed_level: 3
+use_wandb: True
+
+# in-training Protocol A eval callback.
+# Placeholder block (read by the eval callback class).
+callbacks:
+  eval_protocol_a:
+    enabled: True
+    early_fire_at: [2000]
+    every_n_iter: 10000
+    num_rollouts: 5   # human pivot 2026-04-22: lite-rollout eval (5 not 50)
+                      # for faster iteration cadence. 50% per-reward quantization
+                      # is accepted noise. Re-run at 50 for protocol-compliant
+                      # LAPA/LCB paper comparison.
+    env_seed: 0
+    max_steps: 200
+    hist: 5
+    window: 20
+    act_horizon: 10
+    viz_try: True   # production; overrides to False during dev

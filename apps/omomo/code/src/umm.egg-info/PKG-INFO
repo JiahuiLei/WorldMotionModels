@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: umm
+Version: 0.1.0
+Summary: Universal Motion Machine - A generative model for general motion synthesis
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown

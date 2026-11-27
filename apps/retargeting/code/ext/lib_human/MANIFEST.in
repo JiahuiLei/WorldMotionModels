@@ -1,0 +1,12 @@
+# Include documentation files
+include README.md
+include LICENSE
+include MANO_IMPLEMENTATION_SUMMARY.md
+
+# Include package data
+recursive-include src/lib_human *.py
+
+# Exclude test files from distribution
+recursive-exclude tests *
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co]
